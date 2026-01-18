@@ -6,6 +6,7 @@ namespace LegacyBridge\Autoload;
 
 use LegacyBridge\Container\LegacyContainer;
 use LegacyBridge\Http\LegacyBridge;
+use LegacyBridge\Internal\Exception\InvalidRequestException;
 use Psr\Http\Message\ServerRequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Http\Message\UploadedFileFactoryInterface;
@@ -134,15 +135,12 @@ final class Bootstrap
      * @param callable $kernel Application kernel
      * @return void
      *
-     * @throws \RuntimeException If PSR-7 factories not configured
+     * @throws InvalidRequestException If PSR-7 factories not configured
      */
     public function run(callable $kernel): void
     {
         if ($this->requestFactory === null || $this->streamFactory === null || $this->uploadedFileFactory === null) {
-            throw new \RuntimeException(
-                'PSR-7 factories must be configured before running. '
-                . 'Call withPsr7Factories() first.'
-            );
+            throw new \RuntimeException('PSR-7 factories must be configured before calling run(). Use withPsr7Factories() to set them.');
         }
 
         LegacyBridge::run(

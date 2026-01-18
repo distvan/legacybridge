@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace LegacyBridge\Http;
 
+use LegacyBridge\Internal\Adapter\HeaderNormalizer;
+use LegacyBridge\Internal\Exception\InvalidRequestException;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Message\ServerRequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
@@ -52,7 +54,7 @@ final class RequestFactory
      *
      * @return ServerRequestInterface A fully populated PSR-7 ServerRequest
      *
-     * @throws \RuntimeException If required superglobals are missing or malformed
+     * @throws InvalidRequestException If required superglobals are missing or malformed
      */
     public function fromGlobals(): ServerRequestInterface
     {
@@ -110,10 +112,20 @@ final class RequestFactory
      * Extract HTTP method from $_SERVER.
      *
      * @return string HTTP method (GET, POST, PUT, DELETE, etc.)
+     * @throws InvalidRequestException If REQUEST_METHOD is missing
      */
     private function getHttpMethod(): string
     {
-        return strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+        // Get method with fallback to GET
+        $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
+        // Validate HTTP method
+        $validMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT'];
+        if (!in_array($method, $validMethods, true)) {
+            throw InvalidRequestException::invalidHttpMethod($method);
+        }
+
+        return $method;
     }
 
     /**
@@ -125,31 +137,45 @@ final class RequestFactory
      * - Request URI and query string
      *
      * @return string Complete URI (e.g., https://example.com:8080/path?query=value)
+     * @throws InvalidRequestException If URI cannot be created
      */
     private function createUriFromGlobals(): string
     {
-        // Determine scheme
-        $scheme = $this->getScheme();
-        
-        // Get host
-        $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
-        
-        // Get port if not already in host
-        $port = $this->getPort();
-        if ($port && !str_contains($host, ':')) {
-            $host .= ':' . $port;
+        try {
+            // Determine scheme
+            $scheme = $this->getScheme();
+            
+            // Get host
+            $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
+            
+            // Get port if not already in host
+            $port = $this->getPort();
+            if ($port && !str_contains($host, ':')) {
+                $host .= ':' . $port;
+            }
+
+            // Get request URI (path + query string)
+            $requestUri = $_SERVER['REQUEST_URI'] ?? '/';
+
+            $uri = $scheme . '://' . $host . $requestUri;
+            
+            // Basic URI validation
+            if (!filter_var($uri, FILTER_VALIDATE_URL)) {
+                throw InvalidRequestException::malformedUri('Invalid URI format: ' . $uri);
+            }
+
+            return $uri;
+        } catch (InvalidRequestException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw InvalidRequestException::malformedUri($e->getMessage());
         }
-
-        // Get request URI (path + query string)
-        $requestUri = $_SERVER['REQUEST_URI'] ?? '/';
-
-        return $scheme . '://' . $host . $requestUri;
     }
 
     /**
      * Determine the request scheme (HTTP or HTTPS).
      *
-     * Checks:
+     * Checks multiple sources in order of preference:
      * 1. $_SERVER['HTTPS'] (standard)
      * 2. $_SERVER['HTTP_X_FORWARDED_PROTO'] (behind proxy)
      * 3. $_SERVER['REQUEST_SCHEME'] (some servers)
@@ -164,16 +190,14 @@ final class RequestFactory
         }
 
         // Check X-Forwarded-Proto header (behind reverse proxy)
-        if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
-            return strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https' ? 'https' : 'http';
+        $proto = strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '');
+        if ($proto === 'https') {
+            return 'https';
         }
 
-        // Check REQUEST_SCHEME (some servers)
-        if (!empty($_SERVER['REQUEST_SCHEME'])) {
-            return strtolower($_SERVER['REQUEST_SCHEME']);
-        }
-
-        return 'http';
+        // Check REQUEST_SCHEME or default to http
+        $scheme = strtolower($_SERVER['REQUEST_SCHEME'] ?? 'http');
+        return ($scheme === 'https') ? 'https' : 'http';
     }
 
     /**
@@ -235,8 +259,8 @@ final class RequestFactory
     /**
      * Extract HTTP headers from $_SERVER superglobal.
      *
-     * PHP stores HTTP headers in $_SERVER with 'HTTP_' prefix.
-     * This method extracts and normalizes them to PSR-7 format.
+     * Uses HeaderNormalizer to convert PHP's $_SERVER header format
+     * to PSR-7 compatible format.
      *
      * Handles:
      * - HTTP_* variables (converted to Header-Name format)
@@ -246,43 +270,7 @@ final class RequestFactory
      */
     private function getHeadersFromGlobals(): array
     {
-        $headers = [];
-        
-        foreach ($_SERVER as $key => $value) {
-            if ($this->isHttpHeader($key)) {
-                // Remove HTTP_ prefix and convert underscores to dashes
-                $header = str_replace('_', '-', substr($key, 5));
-                $headers[$header][] = $value;
-            } elseif ($this->isSpecialHeader($key)) {
-                // Handle CONTENT_TYPE and CONTENT_LENGTH
-                $header = str_replace('_', '-', $key);
-                $headers[$header][] = $value;
-            }
-        }
-        
-        return $headers;
-    }
-
-    /**
-     * Check if a $_SERVER key represents an HTTP header.
-     *
-     * @param string $key $_SERVER key
-     * @return bool True if key starts with 'HTTP_'
-     */
-    private function isHttpHeader(string $key): bool
-    {
-        return str_starts_with($key, 'HTTP_');
-    }
-
-    /**
-     * Check if a $_SERVER key is a special header (CONTENT_TYPE, CONTENT_LENGTH).
-     *
-     * @param string $key $_SERVER key
-     * @return bool True if key is a special header
-     */
-    private function isSpecialHeader(string $key): bool
-    {
-        return in_array($key, ['CONTENT_TYPE', 'CONTENT_LENGTH'], true);
+        return HeaderNormalizer::normalize($_SERVER);
     }
 
     /**
@@ -300,120 +288,75 @@ final class RequestFactory
     }
 
     /**
-     * Get parsed body from $_POST or raw input.
+     * Get the parsed request body.
      *
-     * Attempts to parse the request body based on Content-Type:
-     * - application/x-www-form-urlencoded: Uses $_POST
-     * - application/json: Parses raw JSON
-     * - multipart/form-data: Uses $_POST
+     * Determines the appropriate parsing based on Content-Type header:
+     * - application/x-www-form-urlencoded: $_POST array
+     * - application/json: Parsed JSON object/array
+     * - Other types: Returns $_POST (fallback)
      *
-     * @return array|null Parsed body or null if not available
+     * @return mixed Parsed body (array or object)
      */
-    private function getParsedBody(): ?array
+    private function getParsedBody()
     {
-        // If $_POST is populated, use it (form data or multipart)
-        if (!empty($_POST)) {
-            return $_POST;
-        }
-
-        // Check Content-Type for JSON
         $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+        
         if (str_contains($contentType, 'application/json')) {
-            $input = file_get_contents('php://input');
-            if ($input) {
-                $decoded = json_decode($input, true);
-                return is_array($decoded) ? $decoded : null;
-            }
+            $body = file_get_contents('php://input');
+            return json_decode($body, true) ?? [];
         }
 
-        return null;
+        return $_POST;
     }
 
     /**
-     * Normalize the $_FILES array into UploadedFile instances.
+     * Normalize $_FILES array to PSR-7 UploadedFile objects.
      *
-     * PHP's $_FILES has an unintuitive structure for multiple file uploads.
-     * This method normalizes it to a more logical structure and creates
-     * PSR-7 UploadedFile instances.
+     * Converts PHP's $_FILES structure to PSR-7 UploadedFileInterface objects
+     * for proper file upload handling.
      *
-     * Handles:
-     * - Single file: <input type="file" name="file">
-     * - Multiple files: <input type="file" name="files[]">
-     * - Nested files: <input type="file" name="data[files][]">
-     *
-     * @param array<string, mixed> $files $_FILES superglobal
-     * @return array<string, mixed> Normalized array of UploadedFile instances
+     * @param array $files The $_FILES superglobal
+     * @return array Normalized uploaded files
      */
     private function normalizeFiles(array $files): array
     {
         $normalized = [];
 
         foreach ($files as $key => $file) {
-            if (!is_array($file) || !isset($file['name'])) {
-                continue;
-            }
-
-            // Check if this is a multi-file upload (name is array)
-            if (is_array($file['name'])) {
-                // Recursively process multiple files
-                $normalized[$key] = $this->normalizeMultipleFiles($file);
-            } else {
-                // Single file upload
-                $normalized[$key] = $this->createUploadedFile($file);
-            }
+            $normalized[$key] = $this->normalizeFileArray($file);
         }
 
         return $normalized;
     }
 
     /**
-     * Normalize multiple file uploads.
+     * Recursively normalize file array entries.
      *
-     * Converts PHP's "files array within an array" structure to individual UploadedFile instances.
+     * Handles both single file uploads and arrays of file uploads.
      *
-     * @param array<string, array> $files File data array (already verified to be multi-file)
-     * @return array Array of UploadedFile instances
+     * @param array $file File entry from $_FILES
+     * @return mixed Normalized UploadedFile or array of UploadedFiles
      */
-    private function normalizeMultipleFiles(array $files): array
+    private function normalizeFileArray(array $file)
     {
-        $normalized = [];
-        $count = count($files['name'] ?? []);
-
-        for ($i = 0; $i < $count; $i++) {
-            $file = [
-                'name' => $files['name'][$i] ?? null,
-                'type' => $files['type'][$i] ?? null,
-                'tmp_name' => $files['tmp_name'][$i] ?? null,
-                'error' => $files['error'][$i] ?? UPLOAD_ERR_NO_FILE,
-                'size' => $files['size'][$i] ?? 0,
-            ];
-
-            // Check if this is a nested array (e.g., input with name="data[files][]")
-            if (is_array($file['name'])) {
-                $normalized[] = $this->normalizeMultipleFiles($file);
-            } else {
-                $normalized[] = $this->createUploadedFile($file);
+        // Handle multiple files (array of uploads)
+        if (is_array($file['tmp_name'])) {
+            $normalized = [];
+            foreach ($file['tmp_name'] as $index => $tmpName) {
+                $normalized[$index] = $this->uploadedFileFactory->createUploadedFile(
+                    $this->streamFactory->createStreamFromFile($tmpName),
+                    (int)($file['size'][$index] ?? 0),
+                    (int)($file['error'][$index] ?? UPLOAD_ERR_NO_FILE),
+                    $file['name'][$index] ?? null,
+                    $file['type'][$index] ?? null
+                );
             }
+            return $normalized;
         }
 
-        return $normalized;
-    }
-
-    /**
-     * Create a single UploadedFile instance.
-     *
-     * @param array<string, mixed> $file File data: name, type, tmp_name, error, size
-     * @return \Psr\Http\Message\UploadedFileInterface Uploaded file instance
-     */
-    private function createUploadedFile(array $file)
-    {
-        $stream = $this->streamFactory->createStreamFromFile(
-            $file['tmp_name'] ?? '',
-            'r'
-        );
-
+        // Handle single file
         return $this->uploadedFileFactory->createUploadedFile(
-            $stream,
+            $this->streamFactory->createStreamFromFile($file['tmp_name']),
             (int)($file['size'] ?? 0),
             (int)($file['error'] ?? UPLOAD_ERR_NO_FILE),
             $file['name'] ?? null,

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace LegacyBridge\Http;
 
 use LegacyBridge\Container\LegacyContainer;
+use LegacyBridge\Internal\Exception\InvalidResponseException;
 use Psr\Container\ContainerInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
@@ -39,6 +40,7 @@ final class LegacyBridge
      * @param ServerRequestFactoryInterface|null $requestFactory
      * @param StreamFactoryInterface|null $streamFactory
      * @param UploadedFileFactoryInterface|null $uploadedFileFactory
+     * @throws InvalidResponseException If kernel does not return ResponseInterface
      */
     public static function run(
         callable $kernel,
@@ -64,9 +66,7 @@ final class LegacyBridge
             $response = $kernel($request, $container);
 
             if (!$response instanceof ResponseInterface) {
-                throw new \RuntimeException(
-                    'Legacy kernel must return a PSR-7 ResponseInterface'
-                );
+                throw InvalidResponseException::notAResponse($response);
             }
         } catch (Throwable $e) {
             ob_end_clean();
