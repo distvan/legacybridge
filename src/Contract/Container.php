@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace LegacyBridge\Container;
+namespace LegacyBridge\Contract;
 
 use Psr\Container\ContainerInterface;
 

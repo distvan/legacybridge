@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace LegacyBridge\Container;
 
+use LegacyBridge\Contract\Container;
 use Psr\Container\NotFoundExceptionInterface;
 use Psr\Container\ContainerExceptionInterface;
 use Throwable;
